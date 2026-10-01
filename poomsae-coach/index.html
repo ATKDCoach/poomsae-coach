@@ -92,6 +92,10 @@ select,input[type="text"]{font:inherit;font-size:16px;color:var(--ink);backgroun
 .stage{position:relative;background:var(--stage);border-radius:10px;overflow:hidden}
 .stage video{display:block;width:100%;max-height:62vh;background:var(--stage)}
 .stage canvas.ov{position:absolute;inset:0;width:100%;height:100%;pointer-events:none}
+.stage #vc{display:block;margin:0 auto;max-width:100%}
+.offscreen{position:absolute!important;left:0;top:0;width:2px!important;height:2px!important;opacity:0;pointer-events:none}
+.rotctl{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+.rotctl .hint{font-size:12px}
 #demoFig{display:block;width:100%;aspect-ratio:16/10;max-width:100%}
 .cmp{display:grid;gap:6px}
 .cmp canvas{width:100%;height:190px;background:var(--surface-2);border-radius:8px;display:block}
@@ -231,6 +235,12 @@ select,input[type="text"]{font:inherit;font-size:16px;color:var(--ink);backgroun
         <canvas id="demoFig" width="800" height="500"></canvas>
         <video id="v" playsinline muted controls preload="auto" hidden></video>
         <canvas class="ov" id="ov" hidden></canvas>
+        <canvas id="vc" hidden></canvas>
+      </div>
+      <div class="rotctl" id="rotCtl" hidden>
+        <button class="btn ghost sm" id="playBtn">▶ 재생</button>
+        <span class="mono" id="rotTime">0:00</span>
+        <span class="hint">눕혀 찍힌 영상이라 바로 세워서 분석했어요</span>
       </div>
       <div class="cmp" id="cmp" hidden>
         <canvas id="cmpc"></canvas>
@@ -334,6 +344,7 @@ select,input[type="text"]{font:inherit;font-size:16px;color:var(--ink);backgroun
         <li>휴대폰은 <b>가슴 높이에 고정</b>(삼각대)하고, 품새선 전체가 들어오도록 4~6m 떨어뜨립니다.</li>
         <li>정면보다 <b>약간 비스듬히(약 45°)</b> 찍으면 팔·다리가 몸에 덜 가려집니다.</li>
         <li>기준 영상과 수련생 영상은 <b>같은 자리, 같은 각도</b>에서 찍어 주세요.</li>
+        <li>휴대폰을 옆으로 눕혀 찍어도 앱이 알아서 세워서 분석하지만, <b>세로로 똑바로</b> 들고 찍는 것이 가장 정확합니다.</li>
         <li>밝은 곳, 단순한 배경, <b>화면에 한 명만</b>. 뒤에 다른 수련생이 지나가면 잘못 잡힐 수 있습니다.</li>
       </ul>
     </div>
@@ -588,7 +599,34 @@ function toFrame(t, r){
   let c = 0; KEY.forEach(i => c += l2[i*3+2]); c /= KEY.length;
   return { t, ok: c > 0.45, conf: c, l2, w, f: feats(w) };
 }
-async function extract(file, v, ovc, fps, cx, onProg){
+/* ---------- 영상 방향 자동 바로잡기 ---------- */
+// 휴대폰을 옆으로 들고 찍어 사람이 누워 보이면, 머리·발 위치로 방향을 찾아 세워서 분석한다
+let rotCanvas = null;
+function frameImage(v, rot){
+  if (!rot) return v;
+  const w = v.videoWidth, h = v.videoHeight, sw = rot % 180 ? h : w, sh = rot % 180 ? w : h;
+  if (!rotCanvas) rotCanvas = document.createElement("canvas");
+  if (rotCanvas.width !== sw || rotCanvas.height !== sh){ rotCanvas.width = sw; rotCanvas.height = sh; }
+  const g = rotCanvas.getContext("2d");
+  g.setTransform(1, 0, 0, 1, 0, 0); g.translate(sw / 2, sh / 2); g.rotate(rot * Math.PI / 180);
+  g.drawImage(v, -w / 2, -h / 2, w, h);
+  return rotCanvas;
+}
+async function detectRotation(p, v, dur){
+  const votes = { 0: 0, 90: 0, 180: 0, 270: 0 }, W = v.videoWidth || 1, H = v.videoHeight || 1;
+  for (const f of [0.15, 0.3, 0.45, 0.6, 0.75, 0.9]){
+    if (cancelFlag) throw new Error("__cancel");
+    await seekTo(v, dur * f); p.reset(); lastRes = null; await p.send({ image: v });
+    const L = lastRes && lastRes.poseLandmarks; if (!L) continue;
+    const dx = (L[0].x - (L[27].x + L[28].x) / 2) * W, dy = (L[0].y - (L[27].y + L[28].y) / 2) * H; // 발 → 머리
+    if (Math.hypot(dx, dy) < 0.12 * Math.min(W, H)) continue;
+    votes[Math.abs(dy) >= Math.abs(dx) ? (dy < 0 ? 0 : 180) : (dx < 0 ? 90 : 270)]++;
+  }
+  p.reset();
+  const best = Object.entries(votes).sort((a, b) => b[1] - a[1])[0];
+  return best[1] > 0 ? +best[0] : 0;
+}
+async function extract(file, v, onFrame, fps, cx, onProg){
   const p = await getPose(cx); p.reset();
   if (v._url) URL.revokeObjectURL(v._url);
   v._url = URL.createObjectURL(file); v.src = v._url; v.muted = true;
@@ -601,6 +639,7 @@ async function extract(file, v, ovc, fps, cx, onProg){
   const dur = v.duration;
   if (!isFinite(dur) || dur <= 0) throw new Error("영상 길이를 읽지 못했습니다. 다른 영상으로 시도해 주세요.");
   if (dur > 300) throw new Error("영상이 5분을 넘습니다. 품새 부분만 잘라서 올려 주세요.");
+  const rot = await detectRotation(p, v, dur);
   const n = Math.max(2, Math.floor(dur * fps));
   const frames = [];
   for (let i = 0; i < n; i++){
@@ -608,9 +647,9 @@ async function extract(file, v, ovc, fps, cx, onProg){
     const t = Math.min(dur - 0.02, i / fps);
     await seekTo(v, t);
     lastRes = null;
-    await p.send({ image: v });
+    await p.send({ image: frameImage(v, rot) });
     const fr = toFrame(t, lastRes); frames.push(fr);
-    if (ovc) drawOverlay(ovc, v, fr, null);
+    if (onFrame) onFrame(fr, rot);
     onProg(i + 1, n);
   }
   // 빈 프레임 채우기
@@ -621,11 +660,12 @@ async function extract(file, v, ovc, fps, cx, onProg){
     while (k < okIdx.length - 1 && Math.abs(okIdx[k+1] - i) <= Math.abs(okIdx[k] - i)) k++;
     if (!f.ok){ const s = frames[okIdx[k]]; f.w = s.w; f.f = s.f; if (!f.l2) f.l2 = s.l2; f.interp = true; }
   });
-  const kickRefine = await refineKicks(p, v, frames, fps, cx, onProg);
-  return { dur, fps, frames, kickRefine, W: v.videoWidth || 1, H: v.videoHeight || 1, lowConf: 1 - okIdx.length / n };
+  const kickRefine = await refineKicks(p, v, frames, fps, cx, onProg, rot);
+  const VW = v.videoWidth || 1, VH = v.videoHeight || 1;
+  return { dur, fps, frames, kickRefine, rot, W: rot % 180 ? VH : VW, H: rot % 180 ? VW : VH, lowConf: 1 - okIdx.length / n };
 }
 // 높은 발차기는 추적이 다리를 놓치기 쉬워, 차기 구간만 초당 30장·매 장 새로 검출해 다시 잰다
-async function refineKicks(p, v, frames, fps, cx, onProg){
+async function refineKicks(p, v, frames, fps, cx, onProg, rot){
   const ks = detectKicks(frames);
   if (!ks.length) return [];
   p.setOptions({ modelComplexity: cx, smoothLandmarks: false, enableSegmentation: false, minDetectionConfidence: 0.5, minTrackingConfidence: 0.5 });
@@ -636,7 +676,7 @@ async function refineKicks(p, v, frames, fps, cx, onProg){
       let best = -9, bv = 0;
       for (let t = a / fps; t <= b / fps + 1e-6; t += 1 / 30){
         if (cancelFlag) throw new Error("__cancel");
-        p.reset(); await seekTo(v, Math.min(v.duration - 0.02, t)); lastRes = null; await p.send({ image: v });
+        p.reset(); await seekTo(v, Math.min(v.duration - 0.02, t)); lastRes = null; await p.send({ image: frameImage(v, rot || 0) });
         const L = lastRes && lastRes.poseLandmarks; if (!L) continue;
         const hy = (L[23].y + L[24].y) / 2, sy = (L[11].y + L[12].y) / 2, d = (hy - sy) || 1e-6;
         const im = (hy - Math.min(L[27].y, L[28].y, L[31].y, L[32].y)) / d;
@@ -935,6 +975,28 @@ function drawOverlay(c, v, fr, devVal){
   g.fillStyle = "#FFFFFF";
   KEY.concat([0]).forEach(i => { g.beginPath(); g.arc(X(i), Y(i), 3.2, 0, 7); g.fill(); });
 }
+function setRotMode(rot){
+  const v = $("#v"), vc = $("#vc");
+  state.rot = rot || 0;
+  v.classList.toggle("offscreen", !!rot); $("#ov").hidden = !!rot; vc.hidden = !rot;
+  if (rot){
+    const w = rot % 180 ? v.videoHeight : v.videoWidth, h = rot % 180 ? v.videoWidth : v.videoHeight;
+    const maxW = $("#stage").clientWidth || 360, maxH = window.innerHeight * 0.62, sc = Math.min(maxW / w, maxH / h), dpr = window.devicePixelRatio || 1;
+    vc.style.width = Math.round(w * sc) + "px"; vc.style.height = Math.round(h * sc) + "px";
+    vc.width = Math.round(w * sc * dpr); vc.height = Math.round(h * sc * dpr);
+  }
+}
+function drawRotView(fr, devVal){
+  const v = $("#v"), c = $("#vc"); if (!state.rot || !v.videoWidth || !c.width) return;
+  const g = c.getContext("2d"); g.setTransform(1, 0, 0, 1, 0, 0);
+  g.drawImage(frameImage(v, state.rot), 0, 0, c.width, c.height);
+  if (!fr || !fr.l2) return;
+  const dpr = window.devicePixelRatio || 1, X = i => fr.l2[i*3] * c.width, Y = i => fr.l2[i*3+1] * c.height;
+  g.lineWidth = 3 * dpr; g.lineCap = "round";
+  g.strokeStyle = fr.interp ? "rgba(255,255,255,.35)" : devVal == null ? "#8FB4FF" : devVal < 12 ? "#6FD39B" : devVal < 22 ? "#F2B84B" : "#FF7A6E";
+  BONES.forEach(([a,b]) => { g.beginPath(); g.moveTo(X(a), Y(a)); g.lineTo(X(b), Y(b)); g.stroke(); });
+  g.fillStyle = "#FFFFFF"; KEY.concat([0]).forEach(i => { g.beginPath(); g.arc(X(i), Y(i), 3.2 * dpr, 0, 7); g.fill(); });
+}
 function drawFigure(g, pts, cx, cy, sc, color, width){
   g.strokeStyle = color; g.lineWidth = width; g.lineCap = "round"; g.lineJoin = "round";
   SUB_BONES.forEach(([a,b]) => { g.beginPath(); g.moveTo(cx + pts[a][0]*sc, cy + pts[a][1]*sc); g.lineTo(cx + pts[b][0]*sc, cy + pts[b][1]*sc); g.stroke(); });
@@ -1000,7 +1062,7 @@ function drawTimeline(){
 }
 
 /* ---------- 결과 표시 ---------- */
-const state = { res: null, ref: null, demo: true, demoT: 0, file: null, lastI: -1 };
+const state = { res: null, ref: null, demo: true, demoT: 0, file: null, lastI: -1, rot: 0 };
 function scoreRow(label, val, max, subRow){
   return `<div class="sc${subRow ? " sub" : ""}"><span>${label}</span><span class="bar2"><i style="width:${clamp(val / max, 0, 1) * 100}%"></i></span><span class="v">${val.toFixed(1)} / ${max.toFixed(1)}</span></div>`;
 }
@@ -1051,7 +1113,8 @@ function loop(){
   if (R && !state.demo && !state.busy){
     const v = $("#v"); const i = clamp(Math.round(v.currentTime * R.fps), 0, R.n - 1);
     if (i !== state.lastI || v.paused === false){
-      drawOverlay($("#ov"), v, R.rec.frames[i], R.dev ? R.dev[i] : null);
+      if (state.rot){ drawRotView(R.rec.frames[i], R.dev ? R.dev[i] : null); $("#rotTime").textContent = fmt(v.currentTime) + " / " + fmt(R.dur); }
+      else drawOverlay($("#ov"), v, R.rec.frames[i], R.dev ? R.dev[i] : null);
       if (i !== state.lastI){ drawTimeline(); if (R.dev) drawCompare(i); }
       state.lastI = i;
     }
@@ -1059,7 +1122,10 @@ function loop(){
   requestAnimationFrame(loop);
 }
 requestAnimationFrame(loop);
-window.addEventListener("resize", () => { state.lastI = -1; drawTimeline(); if (state.demo) drawDemoFig(); });
+$("#playBtn").addEventListener("click", () => { const v = $("#v"); if (v.paused){ v.play().catch(() => {}); } else v.pause(); });
+$("#v").addEventListener("play", () => { $("#playBtn").textContent = "❚❚ 멈춤"; });
+$("#v").addEventListener("pause", () => { $("#playBtn").textContent = "▶ 재생"; });
+window.addEventListener("resize", () => { if (state.rot && !state.busy) setRotMode(state.rot); state.lastI = -1; drawTimeline(); if (state.demo) drawDemoFig(); });
 
 /* ---------- 결과 복사 ---------- */
 $("#copy").addEventListener("click", () => {
@@ -1106,11 +1172,19 @@ $("#run").addEventListener("click", async () => {
   $("#progTxt").textContent = "분석 엔진 불러오는 중 (처음 한 번, 약 10MB)"; $("#progNum").textContent = ""; $("#progBar").style.width = "0";
   state.demo = false; $("#demoFig").hidden = true; $("#v").hidden = false; $("#ov").hidden = false; $("#v").controls = false;
   $("#rTag").textContent = "분석 중"; $("#rTag").classList.remove("demo");
+  // 예시 결과를 지우고 '분석 중' 상태로
+  state.res = null; state.lastI = -1; setRotMode(0); $("#rotCtl").hidden = true;
+  $("#rTitle").textContent = (student ? student + " · " : "") + poomsae;
+  $("#sTotal").textContent = "–"; $("#split").innerHTML = ""; $("#metrics").innerHTML = ""; $("#cats").innerHTML = ""; $("#legend").innerHTML = "";
+  $("#issues").innerHTML = `<li class="none">분석이 끝나면 점수와 지적 사항이 여기에 나옵니다.</li>`; $("#cmp").hidden = true;
+  { const tl = $("#tl"); tl.getContext("2d").clearRect(0, 0, tl.width, tl.height); }
   $("#stage").scrollIntoView({ block: "nearest" });
   try {
     await updateRefStatus();
     const t0 = performance.now();
-    const rec = await extract(state.file, $("#v"), $("#ov"), fps, cx, (i, n, m) => {
+    const rec = await extract(state.file, $("#v"), (fr, rot) => {
+      if (rot){ if (state.rot !== rot) setRotMode(rot); drawRotView(fr, null); } else drawOverlay($("#ov"), $("#v"), fr, null);
+    }, fps, cx, (i, n, m) => {
       if (i === -1){ $("#progTxt").textContent = `발차기 높이 다시 확인 중 (${n}/${m})`; $("#progBar").style.width = "100%"; return; }
       const el = (performance.now() - t0) / 1000, rem = el / i * (n - i);
       $("#progTxt").textContent = "관절 추적 중" + (i > 5 ? ` · 약 ${Math.ceil(rem)}초 남음` : "");
@@ -1121,7 +1195,7 @@ $("#run").addEventListener("click", async () => {
     const R = analyze(rec, state.ref, poomsae);
     state.res = R; state.lastI = -1;
     renderResult(R, { poomsae, student });
-    const v = $("#v"); v.controls = true; v.currentTime = 0;
+    const v = $("#v"); setRotMode(rec.rot); v.controls = !rec.rot; $("#rotCtl").hidden = !rec.rot; v.currentTime = 0; state.lastI = -1;
   } catch(e) {
     if (e.message !== "__cancel") showErr($("#err"), e);
     if (!state.res || state.demo){ loadDemo(); }
@@ -1142,7 +1216,7 @@ $("#refRun").addEventListener("click", async () => {
   $("#refErr").hidden = true; $("#refRun").disabled = true; $("#refProg").hidden = false; $("#refStage").hidden = false; cancelFlag = false;
   $("#refProgTxt").textContent = "분석 엔진 불러오는 중"; $("#refProgBar").style.width = "0";
   try {
-    const rec = await extract(state.refFile, $("#rv"), $("#rov"), 10, 1, (i, n, m) => {
+    const rec = await extract(state.refFile, $("#rv"), (fr, rot) => { if (!rot) drawOverlay($("#rov"), $("#rv"), fr, null); }, 10, 1, (i, n, m) => {
       if (i === -1){ $("#refProgTxt").textContent = `발차기 높이 다시 확인 중 (${n}/${m})`; return; }
       $("#refProgTxt").textContent = "시범 동작 추적 중"; $("#refProgNum").textContent = `${i} / ${n}`; $("#refProgBar").style.width = (i / n * 100) + "%";
     });
